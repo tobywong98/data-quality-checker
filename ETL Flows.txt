@@ -1,0 +1,200 @@
+def get_sales_data(self):
+        sdf = self.raw_tables['sales_info']
+        sdf = sdf.withColumnRenamed("ARTICLE_VARIANTS", "SKU")
+        # sdf = sdf[
+        #     ['SYS_DIVISION', 'TRX_DATE', 'COUNT_HOUR', 'SALES_ORG', 'TRX_NO', 'TRX_TIME', 'SHOP', 'STOR_LOC', 'VIPCODE', 'VOID_NO',
+        #      'PROMOTION_CODE', 'GENERIC_ARTICLE', 'SKU', 'CE1S_SALESMAN', 'TRANSACTION_SEASON', 'SALES_QTY', 'SALES_AMOUNT', 'SALES_COST',
+        #      'GP_AMT', 'ORIGINAL_RT_AMT', 'CURRENT_RT_AMT', 'COUPON_DEDUCT_AMT', 'BILLING_TYPE', 'CS_SURVEY', 'DISCOUNT_CARD',
+        #      'CS_SURVEY_DESC']]
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+        sdf = sdf.join(self.raw_tables['promotion_master'], ['SYS_DIVISION', 'PROMOTION_CODE'], how='left')
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SYS_DIVISION', 'SHOP'], how='left')
+        sdf = sdf.withColumnRenamed("CS_SURVEY_DESC", "NATIONALITY")
+        sdf = sdf.withColumn("IS_PROM", f.when(sdf["PROMOTION_CODE"].isNull(), "Normal").
+                             when(f.substring(sdf['PROMOTION_CODE'], 1, 5) == "STAFF", "Staff").
+                             otherwise("Promotion"))
+        sdf = sdf.withColumn("DISC_ITEM", f.when((1-sdf["CURRENT_RT_AMT"]/sdf["ORIGINAL_RT_AMT"] < 0.005), "Regular").
+                             otherwise("Discount"))
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("SALES"))
+        sdf = sdf.withColumnRenamed("CS_SURVEY_DESC", "NATIONALITY")
+        sdf = sdf.withColumn("REC_TYPE", f.when(sdf["REC_TYPE"] == "SALES", "SALES_AS_SOH"))
+
+        sdf = sdf.withColumn("TRX_SEASON_ON_DATE", f.when(f.month(sdf['TRX_DATE']) == 1, f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q3")))
+                                                    .when((f.month(sdf['TRX_DATE']) != 1) & (f.month(sdf['TRX_DATE']) <= 7), f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q1")))
+                                                    .when(f.month(sdf['TRX_DATE']) >= 8, f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q1"))))
+
+        sdf = sdf.withColumn("STD_SOH_QTY_SOLD", f.when((sdf["TRX_SEASON_ON_DATE"] == str(((datetime.date.today()-datetime.timedelta(days=1)).year-1)) + "Q3") |
+                                                        (sdf["TRX_SEASON_ON_DATE"] == str((datetime.date.today() - datetime.timedelta(days=1)).year) + "Q1") |
+                                                        (sdf["TRX_SEASON_ON_DATE"] == str((datetime.date.today() - datetime.timedelta(days=1)).year) + "Q3") , sdf["SALES_QTY"]))
+
+        return sdf
+
+    def get_daily_target_and_budget_sdf(self):
+        sdf = self.raw_tables['daily_shop_target']
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.withColumnRenamed("BUDGET", "SALES_BUDGET")
+        sdf = sdf.withColumnRenamed("DAILY_TARGET", "SALES_TARGET")
+        sdf = sdf.withColumnRenamed("BUDGET_GP", "GP_BUDGET")
+        sdf = sdf.withColumnRenamed("FORECAST_GP", "GP_TARGET")
+        sdf = sdf[['SYS_DIVISION', 'SHOP', 'TRX_DATE', 'STOR_LOC', 'SALES_TARGET', 'SALES_BUDGET', 'GP_BUDGET', 'GP_TARGET']]   # select related columns
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SYS_DIVISION', 'SHOP'], how='left')     # Join shop master
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("DAILY_TARGET"))
+
+        return sdf
+
+    def get_month_soh_agg_sdf(self):
+        sdf = self.raw_tables['month_soh']
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.filter(f.year(sdf['TRX_DATE']) == (f.lit(datetime.date.today().year-1)))
+        sdf = sdf.withColumn('DEPT_CODE', sdf['GENERIC_ARTICLE'].substr(1, 1))
+        sdf = sdf.groupBy(['DEPT_CODE', 'TRX_DATE', 'SHOP']).sum('SOH_QTY')
+        sdf = sdf.groupBy(['DEPT_CODE', 'SHOP']).max()
+        sdf = sdf.toDF("DEPT_CODE", "SHOP", "SOH_QTY")
+        sdf = sdf.withColumn("TRX_DATE", f.lit(datetime.date.today()-datetime.timedelta(days=1)))
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SHOP'], how='left')     # Join shop master
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("LY_MAX_CAPACITY"))
+        return sdf
+
+    def get_traffic_count_sdf(self):
+        sdf = self.raw_tables['traffic_count']
+        sdf = sdf.withColumnRenamed('COUNT_DATE', 'TRX_DATE')
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.withColumn("TRF_CNT", sdf['GATE_COUNT'] / 2)
+        sdf = sdf[['SYS_DIVISION', 'SHOP', 'TRF_CNT', 'TRX_DATE', 'STOR_LOC']]
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SYS_DIVISION', 'SHOP'], how='left')  # Join shop master
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("TRAFFIC_COUNT"))
+        return sdf
+
+    def get_current_soh(self):
+        sdf = self.raw_tables['current_soh']
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf[['SYS_DIVISION', 'TRX_DATE', 'SHOP', 'STOR_LOC', 'GENERIC_ARTICLE', 'SKU', 'SOH_CUR_QTY', 'SOH_CUR_AMT',
+                   'INT_SIZE', 'INV_BATCH_SEASON']]
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("CURRENT_SOH"))
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SYS_DIVISION', 'SHOP'], how='left')
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+        return sdf
+
+    def get_month_soh(self):
+        sdf = self.raw_tables['month_soh']
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf[['SYS_DIVISION', 'TRX_DATE', 'SHOP', 'STOR_LOC', 'GENERIC_ARTICLE', 'SKU', 'SOH_QTY', 'SOH_AMT', 'INT_SIZE', 'INV_BATCH_SEASON']]
+        sdf = sdf.withColumn("DATA_TYPE", f.lit("CURRENT_SOH"))
+        sdf = sdf.join(self.raw_tables['shop_master'], ['SYS_DIVISION', 'SHOP'], how='left')
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+        return sdf
+
+    def get_tradeshow_order(self):
+        sdf = self.raw_tables['tradeshow_order']
+        sdf = sdf.withColumn('TRX_DATE', f.regexp_replace(f.regexp_replace(sdf['TRANSACTION_SEASON'], 'Q1', '0201'), 'Q3', '0801'))
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999070000', 'GW'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999080000', 'GW'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999030000', 'CB'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999060000', 'CB'))
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+        return sdf
+
+    def _tradeshow_order_operation(self, dataframe, column_name, check_column, output_column):
+        yesterday = datetime.date.today()-datetime.timedelta(days=1)
+        if yesterday.month == 1:
+            dataframe = dataframe.withColumn(column_name, f.when(dataframe[check_column] == str(yesterday.year-1) + "Q3", dataframe[output_column])\
+                                                .when(dataframe[check_column] != str(yesterday.year-1) + "Q3", f.lit(0)))
+        elif yesterday.month != 1 and yesterday.month <= 7:
+            dataframe = dataframe.withColumn(column_name, f.when(dataframe[check_column] == str(yesterday.year) + "Q1", dataframe[output_column])\
+                                                .when(dataframe[check_column] != str(yesterday.year) + "Q1", f.lit(0)))
+        else:
+            dataframe = dataframe.withColumn(column_name, f.when(dataframe[check_column] == str(yesterday.year) + "Q3", dataframe[output_column])\
+                                                .when(dataframe[check_column] != str(yesterday.year) + "Q3", f.lit(0)))
+
+        return dataframe
+
+    def get_tradeshow_order_b(self):
+        sdf = self.raw_tables['tradeshow_order']
+        sdf = sdf.withColumn('TRX_DATE', f.regexp_replace(f.regexp_replace(sdf['TRANSACTION_SEASON'], 'Q1', '0201'), 'Q3', '0801'))
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999070000', 'GW'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999080000', 'GW'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999030000', 'CB'))
+        sdf = sdf.withColumn("BRAND_CHAIN", f.when(sdf['CUSTOMER_CODE'] == '2999060000', 'CB'))
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+
+        sdf = self._tradeshow_order_operation(sdf, "STD_TS_ORG_AMT", "TRANSACTION_SEASON", "TS_FO_ORG_AMT")
+        sdf = self._tradeshow_order_operation(sdf, "STD_TS_FO_QTY", "TRANSACTION_SEASON", "TS_FO_QTY")
+        sdf = self._tradeshow_order_operation(sdf, "STD_TS_FO_COST", "TRANSACTION_SEASON", "TS_FO_COST")
+
+        sdf = sdf.withColumn("TRANSACTION_SEASON", f.when(f.month(sdf['TRX_DATE']) == 1, f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q3")))
+                                                    .when((f.month(sdf['TRX_DATE']) != 1) & (f.month(sdf['TRX_DATE']) <= 7), f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q1")))
+                                                    .when(f.month(sdf['TRX_DATE']) >= 8, f.concat(f.year(sdf["TRX_DATE"]).cast('string'), f.lit("Q1"))))
+
+        return sdf
+
+    def get_sales_info_ws(self):
+        sdf = self.raw_tables['sales_info_ws']
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+        sdf = sdf.join(self.raw_tables['product_master'], ['SYS_DIVISION', 'GENERIC_ARTICLE'], how='left')
+        return sdf
+
+    def _get_timelapse(self, sdf):
+        sdf = sdf.join(self.raw_tables['ws_shop_info'], ['SHOP'], how='left')
+        sdf = sdf.withColumn("YYYYMM", f.to_date('TRX_DATE', 'yyyyMM'))
+        sdf = sdf.filter(sdf['DAILY_TARGET'] != '')
+        sdf = sdf.withColumn("TRX_DATE", f.to_date('TRX_DATE', 'yyyyMMdd'))
+
+        sdf = sdf.withColumn("DAILY_TARGET",
+                             f.sum(sdf['DAILY_TARGET']).over(
+                                 Window.partitionBy(['TRX_DATE', 'YYYYMM', 'CHAIN', 'BRAND_CHAIN'])))
+        sdf = sdf.withColumn("MONTHLY_TARGET",
+                             f.sum(sdf['DAILY_TARGET']).over(
+                                 Window.partitionBy(['YYYYMM', 'CHAIN', 'BRAND_CHAIN'])))
+
+        sdf = sdf.withColumn("SHOP", f.when((sdf['BRAND_CHAIN'] == 'GW') & (sdf['CHAIN'] == "EM"), '1281'))
+        sdf = sdf.withColumn("SHOP", f.when((sdf['BRAND_CHAIN'] == 'CB') & (sdf['CHAIN'] == "EM"), '1081'))
+        sdf = sdf.withColumn("SHOP", f.when((sdf['BRAND_CHAIN'] == 'GW') & (sdf['CHAIN'] != "EM"), '1201'))
+        sdf = sdf.withColumn("SHOP", f.when((sdf['BRAND_CHAIN'] == 'CB') & (sdf['CHAIN'] != "EM"), '1001'))
+        sdf = sdf.withColumn("TIMELAPSE", f.col("DAILY_TARGET") / f.col("MONTHLY_TARGET"))
+        sdf = sdf.withColumnRenamed("YYYYMM", "MONTH")
+        sdf = sdf[['MONTH', 'SHOP', 'TIMELAPSE', 'TRX_DATE']]
+        return sdf
+
+    def get_ws_dtarget(self):
+        sdf = self.raw_tables['ws_dtarget']
+        sdf = self._get_timelapse(sdf)
+        ## join excel file
+
+        excel_sdf = read_excel_tables()
+        excel_sdf['BRAND_CODE'] = excel_sdf['BRAND_CODE'].astype(str)
+        excel_sdf['MONTH'] = excel_sdf['MONTH'].astype(str)
+        excel_sdf = self.spark.createDataFrame(excel_sdf)
+
+        sdf = excel_sdf.join(sdf, ['SHOP', 'MONTH'], how='left')
+        sdf = sdf.join(self.raw_tables['ws_shop_info'], ['SHOP'], how='left')
+        sdf = sdf.withColumn("THIS_SEASON", f.col("TS_COGS_TARGET") / f.col("TIMELAPSE"))
+        sdf = sdf.withColumn("LAST_SEASON", f.col("LS_COGS_TARGET") / f.col("TIMELAPSE"))
+        sdf = sdf.withColumn("PAST_SEASON", f.col("PS_COGS_TARGET") / f.col("TIMELAPSE"))
+
+        sdf_this = sdf
+        sdf_last = sdf
+        sdf_past = sdf
+
+        sdf_this = sdf_this.withColumn("RELATIVE_SEASON", f.lit("THIS_SEASON"))
+        sdf_this = sdf_this.withColumn("COGS_TARGET", f.col("TS_COGS_TARGET") / f.col("TIMELAPSE"))
+        sdf_last = sdf_last.withColumn("RELATIVE_SEASON", f.lit("LAST_SEASON"))
+        sdf_last = sdf_last.withColumn("COGS_TARGET", f.col("LS_COGS_TARGET") / f.col("TIMELAPSE"))
+        sdf_past = sdf_past.withColumn("RELATIVE_SEASON", f.lit("PAST_SEASON"))
+        sdf_past = sdf_past.withColumn("COGS_TARGET", f.col("PS_COGS_TARGET") / f.col("TIMELAPSE"))
+
+        sdf = sdf_this.union(sdf_last)
+        sdf = sdf.union(sdf_past)
+
+        for col in ["LAST_SEASON", "PAST_SEASON", "THIS_SEASON", "TS_COGS_TARGET", "LS_COGS_TARGET",
+                    "PS_COGS_TARGET"]:
+            sdf = sdf.drop(col)
+
+        return sdf
+
+if _name_ == "_main_":
+    print(datetime.datetime.now())
+    luigi.build([TaskUpload_BRANDS_T_SALES_OLAP(date=datetime.date.today())], local_scheduler=True)
+    print(datetime.datetime.now())

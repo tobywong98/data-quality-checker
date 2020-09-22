@@ -1,0 +1,442 @@
+import pandas as pd # pandas for data manipulation
+import numpy as np # numpy for sure
+from scipy.sparse import coo_matrix # for constructing sparse matrix
+from lightfm import LightFM # model
+from lightfm.evaluation import auc_score, precision_at_k, recall_at_k # evaluation
+import time # timing
+import warnings
+warnings.filterwarnings("ignore")
+
+class dataframe:
+    
+    def _init_(self, startdate, enddate):
+        self.df  = self.import_and_cleaning() # clean dataframe
+        self.model_df, self.analysis_df = self.validation_split(startdate, enddate) # split dataframe by date
+        self.member_list = self.get_member_list() # get member code in a list
+        self.train_df, self.test_df = self.train_test_split(0.8) # split the train test dataframe
+        
+    def import_and_cleaning(self):
+        df = pd.read_csv('by customer ml csv.csv') # importing datasets
+        matching = pd.read_csv('matching1.csv') # import product feature
+        df = df.merge(matching, how="left", on = ['GENERIC_ARTICLE (PRODUCT_INFO)']) # merge
+        df = df[df.STYLE_DESC != "Ecommerce Transfer Fee"]
+        df = df[df.DEPT_DESC != 'Premium Stock']
+        df = df.sort_values(by=['TRX_DATE'])
+        df = df.dropna()
+        return df
+    
+    def validation_split(self, date, enddate):
+        model_df = self.df[self.df.TRX_DATE < date ]
+        analysis_df = self.df[(self.df.TRX_DATE >= date) & (self.df.TRX_DATE <= enddate)]
+        return model_df, analysis_df
+        
+    def get_member_list(self):
+        member_list = self.model_df['MEMBER_CODE'].tolist()
+        member_list = list(dict.fromkeys(member_list))
+        return member_list
+    
+    def train_test_split(self, train_ratio):
+        train_df = self.model_df.iloc[:int(train_ratio*len(self.model_df.index))]
+        test_df = self.model_df.iloc[int(train_ratio*len(self.model_df.index))+1:]
+        return train_df, test_df
+    
+    def analysis_to_csv(self):
+        self.analysis_df.to_csv('checking_ga.csv',index=False)
+
+class functions: 
+
+    def get_user_list(self, df, user_column):
+        """
+
+        creating a list of user from dataframe df, user_column is a column 
+        consisting of users in the dataframe df
+
+        """
+
+        return np.sort(df[user_column].unique())
+
+    def get_item_list(self, df, item_name_column):
+
+        """
+
+        creating a list of items from dataframe df, item_column is a column 
+        consisting of items in the dataframe df
+
+        return to item_id_list and item_id2name_mapping
+
+        """
+
+        item_list = df[item_name_column].unique()
+
+
+        return item_list
+
+    def get_feature_list(self, df, aisle_name_column, department_name_column, cat_col, fun_col):
+
+        aisle = df[aisle_name_column]
+        department = df[department_name_column]
+        cat = df[cat_col]
+        fun = df[fun_col]
+
+        return pd.concat([aisle, department, cat, fun], ignore_index = True).unique()
+
+    def id_mappings(self, user_list, item_list, feature_list):
+        """
+
+        Create id mappings to convert user_id, item_id, and feature_id
+
+        """
+        user_to_index_mapping = {}
+        index_to_user_mapping = {}
+        for user_index, user_id in enumerate(user_list):
+            user_to_index_mapping[user_id] = user_index
+            index_to_user_mapping[user_index] = user_id
+
+        item_to_index_mapping = {}
+        index_to_item_mapping = {}
+        for item_index, item_id in enumerate(item_list):
+            item_to_index_mapping[item_id] = item_index
+            index_to_item_mapping[item_index] = item_id
+
+        feature_to_index_mapping = {}
+        index_to_feature_mapping = {}
+        for feature_index, feature_id in enumerate(feature_list):
+            feature_to_index_mapping[feature_id] = feature_index
+            index_to_feature_mapping[feature_index] = feature_id
+
+
+        return user_to_index_mapping, index_to_user_mapping, \
+               item_to_index_mapping, index_to_item_mapping, \
+               feature_to_index_mapping, index_to_feature_mapping
+
+    def get_user_product_interaction(self, train_df, test_df):
+
+        # creating a dataframe consists of TWO columns user_id, and product_name (product bought by the user) for the train data
+        user_to_product_train_df = train_df[['MEMBER_CODE','TRX_NO','GENERIC_ARTICLE (PRODUCT_INFO)','STYLE_DESC']].copy()
+
+        # giving rating as the number of product purchase count
+        user_to_product_train_df["product_count"] = 1
+        user_to_product_rating_train = user_to_product_train_df.groupby(["MEMBER_CODE", "GENERIC_ARTICLE (PRODUCT_INFO)"], as_index = False)["product_count"].sum()
+
+        # creating a dataframe consists of TWO columns user_id, and product_name (product bought by the user) for the test data
+        user_to_product_test_df = test_df[['MEMBER_CODE','TRX_NO','GENERIC_ARTICLE (PRODUCT_INFO)','STYLE_DESC']].copy()
+
+        # giving rating as the number of product purchase count (including the previous purchase in the training data)
+        user_to_product_test_df["product_count"] = 1
+        user_to_product_rating_test = user_to_product_test_df.groupby(["MEMBER_CODE", "GENERIC_ARTICLE (PRODUCT_INFO)"], as_index = False)["product_count"].sum()
+
+        # merging with the previous training user_to_product_rating_training
+
+        user_to_product_rating_test = user_to_product_rating_test.\
+        merge(user_to_product_rating_train.rename(columns = {"product_count" : "previous_product_count"}), how = "left").fillna(0)
+        user_to_product_rating_test["product_count"] = user_to_product_rating_test.apply(lambda x: x["previous_product_count"] + \
+                                                                                        x["product_count"], axis = 1)
+        user_to_product_rating_test.drop(columns = ["previous_product_count"], inplace = True)
+
+        return user_to_product_rating_train, user_to_product_rating_test
+
+    def get_product_feature_interaction(self, df, aisle_weight = 0.5, department_weight = 0.5, cat_weight = 1, fun_weight = 1):
+        item_feature_df = df[['GENERIC_ARTICLE (PRODUCT_INFO)','BRAND_DESC','DEPT_DESC', "PROD_CAT_DESC", "FUNC_DESC"]]
+
+        # start indexing
+        item_feature_df["GENERIC_ARTICLE (PRODUCT_INFO)"] = item_feature_df["GENERIC_ARTICLE (PRODUCT_INFO)"]
+        item_feature_df["BRAND_DESC"] = item_feature_df["BRAND_DESC"]
+        item_feature_df["DEPT_DESC"] = item_feature_df["DEPT_DESC"]
+        item_feature_df["PROD_CAT_DESC"] = item_feature_df["PROD_CAT_DESC"]
+        item_feature_df["FUNC_DESC"] = item_feature_df["FUNC_DESC"]
+
+        # allocate aisle and department into one column as "feature"
+
+        product_aisle_df = item_feature_df[["GENERIC_ARTICLE (PRODUCT_INFO)", "BRAND_DESC"]].rename(columns = {"BRAND_DESC" : "feature"})
+        product_aisle_df["feature_count"] = aisle_weight # adding weight to aisle feature
+        product_department_df = item_feature_df[["GENERIC_ARTICLE (PRODUCT_INFO)", "DEPT_DESC"]].rename(columns = {"DEPT_DESC" : "feature"})
+        product_department_df["feature_count"] = department_weight # adding weight to department feature
+        product_department_df = item_feature_df[["GENERIC_ARTICLE (PRODUCT_INFO)", "PROD_CAT_DESC"]].rename(columns = {"PROD_CAT_DESC" : "feature"})
+        product_department_df["feature_count"] = cat_weight # adding weight to department feature
+        product_department_df = item_feature_df[["GENERIC_ARTICLE (PRODUCT_INFO)", "FUNC_DESC"]].rename(columns = {"FUNC_DESC" : "feature"})
+        product_department_df["feature_count"] = fun_weight # adding weight to department feature
+
+        # combining aisle and department into one
+        product_feature_df = pd.concat([product_aisle_df, product_department_df], ignore_index=True)
+
+        # saving some memory
+        del item_feature_df
+        del product_aisle_df
+        del product_department_df
+
+
+        # grouping for summing over feature_count
+        product_feature_df = product_feature_df.groupby(["GENERIC_ARTICLE (PRODUCT_INFO)", "feature"], as_index = False)["feature_count"].sum()
+
+
+        return product_feature_df
+
+    def get_interaction_matrix(self, df, df_column_as_row, df_column_as_col, df_column_as_value, row_indexing_map, 
+                              col_indexing_map):
+
+        row = df[df_column_as_row].apply(lambda x: row_indexing_map[x]).values
+        col = df[df_column_as_col].apply(lambda x: col_indexing_map[x]).values
+        value = df[df_column_as_value].values
+
+        return coo_matrix((value, (row, col)), shape = (len(row_indexing_map), len(col_indexing_map)))
+
+class model_prep:
+    
+    def _init_(self, model_df, train_df, test_df):
+        self.model_df = model_df
+        self.train_df = train_df
+        self.test_df = test_df
+        
+        self.f = functions()
+        
+        self.user , self.items, self.features = self.get_user_item_feature_list()
+        self.user_to_index_mapping, self.index_to_user_mapping, self.item_to_index_mapping, self.index_to_item_mapping, self.feature_to_index_mapping, self.index_to_feature_mapping = self.generate_mapping()
+        self.user_to_product_rating_train, self.user_to_product_rating_test, self.product_to_feature = self.convert_to_index()
+        
+        self.user_to_product_interaction_train, self.user_to_product_interaction_test, self.product_to_feature_interaction = self.generate_matrix()
+        
+        
+    def get_user_item_feature_list(self):
+        # create the user, item, feature lists
+        users = self.f.get_user_list(self.model_df, "MEMBER_CODE")
+        items = self.f.get_item_list(self.model_df, "GENERIC_ARTICLE (PRODUCT_INFO)")
+        features = self.f.get_feature_list(self.model_df, "BRAND_DESC", "DEPT_DESC", "PROD_CAT_DESC", "FUNC_DESC")
+        return users, items, features
+
+    def generate_mapping(self):
+        # LightFM library can't read other than (integer) index
+        user_to_index_mapping, index_to_user_mapping, \
+           item_to_index_mapping, index_to_item_mapping, \
+           feature_to_index_mapping, index_to_feature_mapping = self.f.id_mappings(self.user, self.items, self.features)
+        return user_to_index_mapping, index_to_user_mapping, item_to_index_mapping, index_to_item_mapping,feature_to_index_mapping, index_to_feature_mapping
+    
+    def convert_to_index(self):
+        user_to_product_rating_train, user_to_product_rating_test = self.f.get_user_product_interaction(self.train_df, self.test_df)
+        product_to_feature = self.f.get_product_feature_interaction(self.model_df)
+        return user_to_product_rating_train, user_to_product_rating_test, product_to_feature
+    
+    def generate_matrix(self):
+        # generate user_item_interaction_matrix for train data
+        user_to_product_interaction_train = self.f.get_interaction_matrix(self.user_to_product_rating_train, "MEMBER_CODE", 
+                                                            "GENERIC_ARTICLE (PRODUCT_INFO)", "product_count", self.user_to_index_mapping, self.item_to_index_mapping)
+
+        # generate user_item_interaction_matrix for test data
+        user_to_product_interaction_test = self.f.get_interaction_matrix(self.user_to_product_rating_test, "MEMBER_CODE", 
+                                                            "GENERIC_ARTICLE (PRODUCT_INFO)", "product_count", self.user_to_index_mapping, self.item_to_index_mapping)
+
+        # generate item_to_feature interaction
+        product_to_feature_interaction = self.f.get_interaction_matrix(self.product_to_feature, "GENERIC_ARTICLE (PRODUCT_INFO)", "feature",  "feature_count", 
+                                                                self.item_to_index_mapping, self.feature_to_index_mapping)
+        return user_to_product_interaction_train, user_to_product_interaction_test, product_to_feature_interaction
+
+class first_model:
+    
+    def _init_(self):
+        self.model_without_features = LightFM(loss = "warp")
+        self.model_with_features = LightFM(loss = "warp")
+        
+        
+    def build_model_without_feature(self):
+        start = time.time()
+        #===================
+
+        self.model_without_features.fit(p.user_to_product_interaction_train,
+                  user_features=None, 
+                  item_features=None, 
+                  sample_weight=None, 
+                  epochs=20, 
+                  num_threads=4,
+                  verbose=False)
+
+        #===================
+        end = time.time()
+        print("time taken = {0:.{1}f} seconds".format(end - start, 2))
+        
+    def test_model_without_feature(self):
+        # auc metric score (ranging from 0 to 1)
+
+        start = time.time()
+        #===================
+
+        auc_without_features = auc_score(model = self.model_without_features, 
+                                test_interactions = p.user_to_product_interaction_test,
+                                num_threads = 4, check_intersections = False)
+        #===================
+        end = time.time()
+        print("time taken = {0:.{1}f} seconds".format(end - start, 2))
+        print("average AUC without adding item-feature interaction = {0:.{1}f}".format(auc_without_features.mean(), 2))
+        
+    def build_model_with_feature(self):
+        # fitting the model with hybrid collaborative filtering + content based (product + features)
+        start = time.time()
+        #===================
+
+
+        self.model_with_features.fit(p.user_to_product_interaction_train,
+                  user_features=None, 
+                  item_features=p.product_to_feature_interaction, 
+                  sample_weight=None, 
+                  epochs=20, 
+                  num_threads=4,
+                  verbose=False)
+
+        #===================
+        end = time.time()
+        print("time taken = {0:.{1}f} seconds".format(end - start, 2))
+
+    def test_model_with_feature(self):
+        start = time.time()
+        #===================
+        auc_with_features = auc_score(model = self.model_with_features, 
+                                test_interactions = p.user_to_product_interaction_test,
+                                train_interactions = p.user_to_product_interaction_train, 
+                                item_features = p.product_to_feature_interaction,
+                                num_threads = 4, check_intersections=False)
+        #===================
+        end = time.time()
+        print("time taken = {0:.{1}f} seconds".format(end - start, 2))
+        # model, test_interactions, train_interactions=None, 
+        # user_features=None, item_features=None, preserve_rows=False, num_threads=1, check_intersections=True
+        
+        print("average AUC with adding item-feature interaction = {0:.{1}f}".format(auc_with_features.mean(), 2))
+
+class final_model:
+    
+    def _init_(self):
+        self.user_to_product_interaction = self.combined_train_test(p.user_to_product_interaction_train, 
+                                                 p.user_to_product_interaction_test)
+        
+        self.final_model = LightFM(loss = "warp" , random_state = 0, max_sampled = 200)
+        self.build_fianl_model()
+        self.output_df = self.recommendation_for_user(self.final_model, df.member_list, p.items, self.user_to_product_interaction, p.user_to_index_mapping)
+    
+    def combined_train_test(self, train, test):
+        """
+
+        test set is the more recent rating/number_of_order of users.
+        train set is the previous rating/number_of_order of users.
+        non-zero value in the test set will replace the elements in 
+        the train set matrices
+
+        """
+        # initialising train dict
+        train_dict = {}
+        for train_row, train_col, train_data in zip(train.row, train.col, train.data):
+            train_dict[(train_row, train_col)] = train_data
+
+        # replacing with the test set
+
+        for test_row, test_col, test_data in zip(test.row, test.col, test.data):
+            train_dict[(test_row, test_col)] = max(test_data, train_dict.get((test_row, test_col), 0))
+
+
+        # converting to the row
+        row_element = []
+        col_element = []
+        data_element = []
+        for row, col in train_dict:
+            row_element.append(row)
+            col_element.append(col)
+            data_element.append(train_dict[(row, col)])
+
+        # converting to np array
+
+        row_element = np.array(row_element)
+        col_element = np.array(col_element)
+        data_element = np.array(data_element)
+
+        return coo_matrix((data_element, (row_element, col_element)), shape = (train.shape[0], train.shape[1]))
+    
+    def build_fianl_model(self):
+
+        start = time.time()
+        #===================
+
+        self.final_model.fit(self.user_to_product_interaction,
+                  user_features=None, 
+                  item_features=None, 
+                  sample_weight=None, 
+                  epochs=500, 
+                  num_threads=4,
+                  verbose=False)
+
+        #===================
+        end = time.time()
+        print("time taken = {0:.{1}f} seconds".format(end - start, 2))
+        
+    def recommendation_for_user(self, model, user, items, user_to_product_interaction_matrix, user2index_map):
+        
+        df_list = []
+        
+        for u in user:
+        
+            userindex = user2index_map.get(u, None)
+
+            if userindex == None:
+                return None
+
+            users = [userindex]
+
+            # products already bought
+
+            known_positives = items[user_to_product_interaction_matrix.tocsr()[userindex].indices]
+
+            # scores from model prediction
+            scores = model.predict(user_ids = users, item_ids = np.arange(user_to_product_interaction_matrix.shape[1]))
+
+            # top items
+
+            top_items = items[np.argsort(-scores)]
+
+    #       printing out the dataframe
+            known_list = []
+
+            known_list.append(u)
+
+            for x in known_positives[:3]:
+                known_list.append(x)
+
+            while len(known_list) < 4:
+                known_list.append('')
+
+            for x in top_items[:10]:
+                known_list.append(x)
+
+            
+            df_list.append(known_list)
+        
+        output = pd.DataFrame(df_list, columns=['MEMBER_CODE', 'KNOWN 1', 'KNOWN 2', 'KNOWN 3', 'TOP 1', 'TOP 2', 'TOP 3', 'TOP 4', 'TOP 5', 'TOP 6', 'TOP 7', 'TOP 8', 'TOP 9', 'TOP 10'])
+        return output
+    
+    def output_to_csv(self):
+        self.output_df.to_csv('output_ga.csv',index=False)
+
+def generate_report_csv(product):
+    dff = df.analysis_df[['MEMBER_CODE', 'TRX_DATE', product]]
+    dff = dff.merge(model.output_df, how="left", on = ['MEMBER_CODE']) # merge
+    col_list = ['TOP 1', 'TOP 2', 'TOP 3', 'TOP 4', 'TOP 5', 'TOP 6', 'TOP 7', 'TOP 8', 'TOP 9', 'TOP 10']
+    new_col_list = ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE', 'TEN']
+    for i in range(10):
+        comparison_column = np.where(dff[col_list[i]].isna(), np.nan, np.where(dff[col_list[i]] == dff[product], 1, 0))
+        dff[new_col_list[i]] = comparison_column
+    dff['sum'] = dff[new_col_list].sum(axis=1)
+    dff['count'] = np.where(dff['TEN'].isna(), 0, 1)
+    print("Correct guess = ", dff['sum'].sum())
+    print("Total guess = ", dff['count'].sum())
+    ratio = dff['sum'].sum()/ dff['count'].sum()*100
+    print("Guess ratio = ", ratio, "%")
+    dff.to_csv('report_ga.csv',index=False)
+    return ratio
+
+if _name_ == "_main_":
+    timelist = [20200601, 20200607, 20200614, 20200621, 20200628, 20200705, 20200712, 20200719, 20200726, 20200802, 20200809, 20200816, 20200823]
+    ratiolist = []
+    for i in range(len(timelist)-1) :
+        df = dataframe(timelist[i],timelist[i+1])
+        df.analysis_to_csv()
+        p = model_prep(df.model_df, df.train_df, df.test_df)
+        model = final_model()
+        model.output_to_csv()
+        ratio = generate_report_csv('GENERIC_ARTICLE (PRODUCT_INFO)')
+        ratiolist.append(ratio)
+        print("From ", df.analysis_df['TRX_DATE'].min(), " to ", df.analysis_df['TRX_DATE'].max(), " ,done ", i+1, ' ,avg ratio = ', sum(ratiolist) / len(ratiolist), '%')
