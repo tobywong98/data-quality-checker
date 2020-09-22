@@ -183,8 +183,8 @@ class get_db:
         self.alldf_snap = pd.DataFrame
         self.alldf_today = pd.DataFrame
         self.pssql_today = pd.DataFrame
-        self.username = "MJASONWAN"
-        self.password = "MJASONWAN"
+        self.username = ""
+        self.password = ""
         self.clist = self.csv.columns.values.tolist()
         self.ddlist = self.csv.columns.values.tolist()
         self.df_list_today = []
